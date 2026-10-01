@@ -48,6 +48,16 @@ var (
 		Disclosure:   map[string][]string{"alice": {"s1", "s2"}, "bob": {"s2", "s3"}},
 		Actions:      []string{"offer", "result", "confirm_result"}, MaxMessagesPerSide: MaxPerSide, MaxPayload: MaxPayload, ExpiresAt: T0 + 86400, PolicyRevision: 1}
 	mandateIssuedAt = T0 - 3600
+	escapeScope     = func() Scope {
+		e := scope
+		e.CaseID = "case-escape-0001"
+		e.Catalog = map[string]string{
+			"s1": "a<b>&c" + string(rune(0x2028)) + "d" + string(rune(0x2029)) + "e",
+			"s2": "q\"uote\\back" + string(rune(0x01)) + "ctl",
+			"s3": "日本 caf" + string(rune(0xe9)),
+			"s4": "plain"}
+		return e
+	}()
 )
 
 func nonce(label string) string { return hex.EncodeToString(seed("nonce/" + label)[:16]) }
@@ -165,8 +175,12 @@ type Fixture struct {
 	Parties     []PartyVec `json:"parties"`
 	ScopeJSON   string     `json:"scope_json"`
 	ScopeHash   string     `json:"scope_hash"`
-	Purpose     string     `json:"purpose"`
-	MandateIAt  int64      `json:"mandate_issued_at"`
+	// EscapeScope exercises Go JSON string escaping in the scope hash (WIRE_FORMAT §8.2): catalog values with
+	// < > & U+2028 U+2029, a quote, a backslash, a control character and non-ASCII text.
+	EscapeScopeJSON string `json:"escape_scope_json"`
+	EscapeScopeHash string `json:"escape_scope_hash"`
+	Purpose         string `json:"purpose"`
+	MandateIAt      int64  `json:"mandate_issued_at"`
 }
 
 type ObjectVec struct {
@@ -258,7 +272,8 @@ func build() Vectors {
 	v.Fixture = Fixture{Description: "Shared inputs for all pan-protocol wire vectors. Seeds are Ed25519 RFC 8032 private seeds (hex). Synthetic data only.",
 		Generator: "pan-bridge/cmd/vectors with github.com/pilot-protocol/common v0.5.13 and github.com/pilot-protocol/dataexchange v0.2.2",
 		Tenant:    Tenant, T0: T0, FrameCap: FrameCap, MaxEnvelope: MaxPayload, ProofTTL: proofTTL,
-		ScopeJSON: string(scope.JSON()), ScopeHash: scope.Hash(), Purpose: scope.purpose(), MandateIAt: mandateIssuedAt}
+		ScopeJSON: string(scope.JSON()), ScopeHash: scope.Hash(), Purpose: scope.purpose(), MandateIAt: mandateIssuedAt,
+		EscapeScopeJSON: string(escapeScope.JSON()), EscapeScopeHash: escapeScope.Hash()}
 	for _, p := range []*party{alice, bob, carol} {
 		v.Fixture.Parties = append(v.Fixture.Parties, PartyVec{p.Participant, hex.EncodeToString(p.intent.Seed()), hex.EncodeToString(p.authority.Seed())})
 	}
