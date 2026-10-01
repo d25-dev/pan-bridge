@@ -403,3 +403,61 @@ func TestBackendSlotsBounded(t *testing.T) {
 		t.Fatal("BUSY was not immediate")
 	}
 }
+
+type stallDaemon struct{ *fakeDaemon }
+
+func (stallDaemon) Dial(protocol.Addr, uint16, time.Duration) (net.Conn, error) { select {} }
+
+// A daemon operation that runs past DaemonStall makes the Bridge exit.
+func TestStallWatchdogExits(t *testing.T) {
+	old, oldExit := daemonStall.Load(), exit
+	defer func() { daemonStall.Store(old); exit = oldExit }()
+	daemonStall.Store(int64(100 * time.Millisecond))
+	exited := make(chan int, 1)
+	exit = func(code int) { exited <- code }
+	f := &fakeDaemon{dialed: make(chan net.Conn, 1), incoming: make(chan net.Conn, 1)}
+	s := &Server{D: stallDaemon{f}, Version: "test", R: func() (Registry, error) { return fakeRegistry{}, nil }}
+	if err := s.Init(); err != nil {
+		t.Fatal(err)
+	}
+	ss := &session{srv: s, streams: map[string]*stream{}, inflight: make(chan struct{}, MaxInFlight)}
+	go ss.dispatch("stream.dial", json.RawMessage(`{"addr":"0:0000.0000.0002","port":1001,"timeout_ms":1000}`))
+	select {
+	case code := <-exited:
+		if code != 3 {
+			t.Fatalf("exit code %d", code)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("a stalled dial did not trigger the watchdog")
+	}
+}
+
+type blockingCloseConn struct{ net.Conn }
+
+func (blockingCloseConn) Close() error { select {} }
+
+// A stream whose close blocks in the daemon must not keep the ended session's port from a replacement Client.
+func TestTeardownReleasesPortDespiteBlockingClose(t *testing.T) {
+	old := daemonStall.Load()
+	defer daemonStall.Store(old)
+	daemonStall.Store(int64(time.Hour)) // keep the watchdog out of this test
+	f, dial := start(t)
+	c1 := dial()
+	if _, e := c1.call("listen", map[string]any{"port": 1001}); e != "" {
+		t.Fatal(e)
+	}
+	a, _ := net.Pipe()
+	f.incoming <- addrConn{blockingCloseConn{a}, "0:0000.0000.0002:49152"}
+	if ev := c1.next(); ev["event"] != "stream.incoming" {
+		t.Fatalf("event %v", ev)
+	}
+	c1.c.Close()
+	c2 := dial()
+	for i := 0; i < 50; i++ {
+		if _, e := c2.call("listen", map[string]any{"port": 1001}); e == "" {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("port not released while a stream close was blocked")
+}

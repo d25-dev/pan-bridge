@@ -19,6 +19,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/pilot-protocol/common/protocol"
@@ -214,15 +215,14 @@ func readLine(r *bufio.Reader, max int) ([]byte, error) {
 	}
 }
 
+// end releases everything the session held. Port ownership is released first, and streams are closed in the
+// background, so a daemon that is slow to close cannot keep a replacement Client from listening.
 func (ss *session) end() {
 	ss.mu.Lock()
 	ss.closed = true
 	streams := ss.streams
 	ss.streams = map[string]*stream{}
 	ss.mu.Unlock()
-	for _, st := range streams {
-		st.c.Close()
-	}
 	ss.srv.mu.Lock()
 	for port, owner := range ss.srv.listeners {
 		if owner == ss {
@@ -230,7 +230,38 @@ func (ss *session) end() {
 		}
 	}
 	ss.srv.mu.Unlock()
+	for _, st := range streams {
+		closeConn(st.c)
+	}
 	ss.c.Close()
+}
+
+// daemonStall is how long one daemon or registry operation may run. A longer one means the daemon (or its IPC) is
+// stuck; the Bridge then exits so that the supervisor restarts it with a fresh daemon connection, which also ends
+// every operation that was still blocked (BRIDGE_API §5).
+var daemonStall atomic.Int64 // nanoseconds; 60 s unless a test changes it
+
+func init() { daemonStall.Store(int64(60 * time.Second)) }
+
+var exit = os.Exit
+
+// watch starts the stall timer for one operation; call the result when the operation returns.
+func watch(op string) func() {
+	d := time.Duration(daemonStall.Load())
+	t := time.AfterFunc(d, func() {
+		log.Printf("daemon operation %s stalled for %v; exiting", op, d)
+		exit(3)
+	})
+	return func() { t.Stop() }
+}
+
+// closeConn closes a Pilot stream without waiting for the daemon.
+func closeConn(c net.Conn) {
+	go func() {
+		done := watch("close")
+		c.Close()
+		done()
+	}()
 }
 
 func newHandle() string {
@@ -298,7 +329,7 @@ func (ss *session) drop(h string) {
 	delete(ss.streams, h)
 	ss.mu.Unlock()
 	if st != nil {
-		st.c.Close()
+		closeConn(st.c)
 	}
 }
 
@@ -395,7 +426,10 @@ func (ss *session) dispatch(method string, raw json.RawMessage) (any, error) {
 			return nil, errBadRequest
 		}
 		return bounded(func() (any, error) {
-			if _, err := s.D.Handshake(a.Node, p.Reason); err != nil {
+			done := watch("handshake")
+			_, err := s.D.Handshake(a.Node, p.Reason)
+			done()
+			if err != nil {
 				return nil, errDaemon
 			}
 			return map[string]any{}, nil
@@ -405,9 +439,9 @@ func (ss *session) dispatch(method string, raw json.RawMessage) (any, error) {
 		if err := decode(raw, &struct{}{}); err != nil {
 			return nil, err
 		}
-		v, err := bounded(func() (any, error) { return s.D.TrustedPeers() })
-		if errors.Is(err, errTimeout) {
-			return nil, errTimeout
+		v, err := bounded(func() (any, error) { defer watch("trusted")(); return s.D.TrustedPeers() })
+		if errors.Is(err, errTimeout) || errors.Is(err, errBusy) {
+			return nil, err
 		}
 		res, _ := v.(map[string]interface{})
 		if err != nil || res == nil {
@@ -474,14 +508,19 @@ func (ss *session) dispatch(method string, raw json.RawMessage) (any, error) {
 		if !ss.reserve() {
 			return nil, errBusy
 		}
+		done := watch("dial")
 		c, err := s.D.Dial(a, uint16(p.Port), to)
+		done()
 		if err != nil {
 			ss.release()
+			if errors.Is(err, os.ErrDeadlineExceeded) || strings.Contains(strings.ToLower(err.Error()), "timeout") {
+				return nil, errTimeout
+			}
 			return nil, errDial
 		}
 		h, ok := ss.add(c, true)
 		if !ok {
-			c.Close()
+			closeConn(c)
 			return nil, errClosed
 		}
 		return map[string]any{"conn": h}, nil
@@ -516,7 +555,9 @@ func (ss *session) dispatch(method string, raw json.RawMessage) (any, error) {
 			return nil, errUnknownConn
 		}
 		st.c.SetWriteDeadline(time.Now().Add(to))
+		done := watch("write")
 		n, err := st.c.Write(data)
+		done()
 		if err != nil {
 			// A failed or timed-out write leaves an unknown number of bytes sent: the stream is unusable. It is
 			// retired before the lock is released, so no queued write can follow it on this stream.
@@ -555,7 +596,9 @@ func (ss *session) dispatch(method string, raw json.RawMessage) (any, error) {
 			return nil, errUnknownConn
 		}
 		st.c.SetReadDeadline(time.Now().Add(to))
+		done := watch("read")
 		n, err := st.c.Read(buf)
+		done()
 		switch {
 		case n > 0:
 			return map[string]any{"data_b64": base64.StdEncoding.EncodeToString(buf[:n]), "eof": false}, nil
@@ -598,7 +641,9 @@ func (s *Server) lookup(a protocol.Addr) (any, error) {
 		s.reg, reg = r, r
 		s.mu.Unlock()
 	}
+	done := watch("lookup")
 	res, err := reg.Lookup(a.Node)
+	done()
 	if err != nil {
 		if strings.Contains(strings.ToLower(err.Error()), "not found") {
 			return nil, errNotFound
@@ -638,7 +683,9 @@ func (s *Server) listen(ss *session, port uint16) error {
 	if opened {
 		return nil
 	}
+	done := watch("listen")
 	l, err := s.D.Listen(port)
+	done()
 	if err != nil {
 		s.mu.Lock()
 		if s.listeners[port] == ss {
@@ -665,17 +712,17 @@ func (s *Server) accept(l Listener, port uint16) {
 		owner := s.listeners[port]
 		s.mu.Unlock()
 		if owner == nil {
-			c.Close()
+			closeConn(c)
 			continue
 		}
 		sa, err := protocol.ParseSocketAddr(c.RemoteAddr().String())
 		if err != nil {
-			c.Close()
+			closeConn(c)
 			continue
 		}
 		h, ok := owner.add(c, false)
 		if !ok {
-			c.Close()
+			closeConn(c)
 			continue
 		}
 		owner.send(map[string]any{"event": "stream.incoming", "conn": h, "port": port, "remote_addr": sa.Addr.String()})
