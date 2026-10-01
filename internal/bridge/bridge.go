@@ -315,6 +315,26 @@ func timeout(ms int) (time.Duration, error) {
 }
 
 // nodeAddr renders a node of our own network in canonical text form.
+// internalTimeout bounds calls that take no timeout_ms (BRIDGE_API §5): handshake, trusted peers, registry lookup.
+const internalTimeout = 10 * time.Second
+
+// bounded runs f with internalTimeout. On expiry it answers TIMEOUT; f keeps running until the daemon or registry
+// returns, and its result is discarded.
+func bounded(f func() (any, error)) (any, error) {
+	type out struct {
+		v   any
+		err error
+	}
+	ch := make(chan out, 1)
+	go func() { v, err := f(); ch <- out{v, err} }()
+	select {
+	case o := <-ch:
+		return o.v, o.err
+	case <-time.After(internalTimeout):
+		return nil, errTimeout
+	}
+}
+
 func (s *Server) nodeAddr(node uint32) string {
 	return protocol.Addr{Network: s.self.Network, Node: node}.String()
 }
@@ -354,17 +374,23 @@ func (ss *session) dispatch(method string, raw json.RawMessage) (any, error) {
 		if err != nil || len(p.Reason) == 0 || len(p.Reason) > 256 {
 			return nil, errBadRequest
 		}
-		if _, err := s.D.Handshake(a.Node, p.Reason); err != nil {
-			return nil, errDaemon
-		}
-		return map[string]any{}, nil
+		return bounded(func() (any, error) {
+			if _, err := s.D.Handshake(a.Node, p.Reason); err != nil {
+				return nil, errDaemon
+			}
+			return map[string]any{}, nil
+		})
 
 	case "peer.trusted":
 		if err := decode(raw, &struct{}{}); err != nil {
 			return nil, err
 		}
-		res, err := s.D.TrustedPeers()
-		if err != nil {
+		v, err := bounded(func() (any, error) { return s.D.TrustedPeers() })
+		if errors.Is(err, errTimeout) {
+			return nil, errTimeout
+		}
+		res, _ := v.(map[string]interface{})
+		if err != nil || res == nil {
 			return nil, errDaemon
 		}
 		peers := []map[string]string{}
@@ -394,7 +420,7 @@ func (ss *session) dispatch(method string, raw json.RawMessage) (any, error) {
 		if err != nil {
 			return nil, err
 		}
-		return s.lookup(a)
+		return bounded(func() (any, error) { return s.lookup(a) })
 
 	case "listen":
 		var p struct {
