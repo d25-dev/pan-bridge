@@ -633,7 +633,9 @@ func (s *Server) lookup(a protocol.Addr) (any, error) {
 	reg := s.reg
 	s.mu.Unlock()
 	if reg == nil {
+		done := watch("registry-dial")
 		r, err := s.R()
+		done()
 		if err != nil {
 			return nil, errRegistry
 		}
