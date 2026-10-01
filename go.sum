@@ -1,0 +1,8 @@
+github.com/pilot-protocol/common v0.5.13 h1:h9NmPh37ZZujktpSAwgq2H2ai7jG240nQTetGNWtZ3U=
+github.com/pilot-protocol/common v0.5.13/go.mod h1:Ybc6f1A37s3ShoEh1nBMVL9DPyYlxvkqPTvtbxaNWg4=
+github.com/pilot-protocol/dataexchange v0.2.2 h1:h1VJFqFCdMDtX1E2E8zxTQPw+9rWnMohXN8b6HpB2R0=
+github.com/pilot-protocol/dataexchange v0.2.2/go.mod h1:TUj2QtNMZ4oMnOag1j5k5qDxz2457S8uaB2FJif1Ulk=
+github.com/pilot-protocol/eventstream v0.2.2 h1:E0IjveK7K+dsIbE/5hD3N821FkHzxVsx1tiAORMzt8k=
+github.com/pilot-protocol/eventstream v0.2.2/go.mod h1:gUjoMEItW1SRJYEq39VlcIeDe2LcE5B18/4bcaUJNrs=
+golang.org/x/sys v0.47.0 h1:o7XGOvZQCADBQQ4Y7VNq2dRWQR7JmOUW8Kxx4ZsNgWs=
+golang.org/x/sys v0.47.0/go.mod h1:4GL1E5IUh+htKOUEOaiffhrAeqysfVGipDYzABqnCmw=
