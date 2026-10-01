@@ -275,3 +275,75 @@ func TestMalformedLineEndsSession(t *testing.T) {
 		t.Fatalf("session kept open after a malformed line: %v", err)
 	}
 }
+
+// A second Bridge on the same runtime dir refuses to start instead of replacing the live socket.
+func TestSecondInstanceRefused(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "rt")
+	ln, _, err := ListenSocket(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	if _, _, err := ListenSocket(dir); err == nil {
+		t.Fatal("second instance took over the runtime dir")
+	}
+}
+
+// A failed write retires the handle (UNKNOWN_CONN afterwards).
+func TestFailedWriteRetiresHandle(t *testing.T) {
+	f, dial := start(t)
+	c := dial()
+	r, _ := c.call("stream.dial", map[string]any{"addr": "0:0000.0000.0002", "port": 1001, "timeout_ms": 1000})
+	(<-f.dialed).Close()
+	if _, e := c.call("stream.write", map[string]any{"conn": r["conn"], "data_b64": base64.StdEncoding.EncodeToString([]byte("x")), "timeout_ms": 500}); e == "" {
+		t.Fatal("write to a closed peer succeeded")
+	}
+	if _, e := c.call("stream.read", map[string]any{"conn": r["conn"], "max": 1, "timeout_ms": 100}); e != "UNKNOWN_CONN" {
+		t.Fatalf("handle still usable after a failed write: %s", e)
+	}
+}
+
+// A session that ended releases the port, and a new session can listen on it.
+func TestListenOwnershipReleasedOnEnd(t *testing.T) {
+	_, dial := start(t)
+	c1 := dial()
+	if _, e := c1.call("listen", map[string]any{"port": 1001}); e != "" {
+		t.Fatal(e)
+	}
+	c1.c.Close()
+	c2 := dial()
+	for i := 0; i < 50; i++ {
+		if _, e := c2.call("listen", map[string]any{"port": 1001}); e == "" {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("port stayed owned by an ended session")
+}
+
+// Concurrent dials cannot exceed the stream limit (slots are reserved before dialing).
+func TestConcurrentDialsBounded(t *testing.T) {
+	f, dial := start(t)
+	c := dial()
+	go func() {
+		for range f.dialed {
+		}
+	}()
+	ids := make([]uint64, 0, 40)
+	for i := 0; i < 40; i++ {
+		c.id++
+		ids = append(ids, c.id)
+		b, _ := json.Marshal(map[string]any{"id": c.id, "method": "stream.dial", "params": map[string]any{"addr": "0:0000.0000.0002", "port": 1001, "timeout_ms": 1000}})
+		c.c.Write(append(b, '\n'))
+	}
+	ok := 0
+	for range ids {
+		m := c.next()
+		if _, isErr := m["error"]; !isErr {
+			ok++
+		}
+	}
+	if ok != MaxStreams {
+		t.Fatalf("%d dials succeeded, want %d", ok, MaxStreams)
+	}
+}

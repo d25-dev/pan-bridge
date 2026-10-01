@@ -29,6 +29,7 @@ const (
 	MaxLine        = 262144
 	MaxRead        = 65552
 	MaxStreams     = 16
+	MaxInFlight    = 64 // concurrent requests per session; more are answered BUSY
 	MaxTimeoutMS   = 30000
 	maxWriteBase64 = 4 * ((MaxRead + 2) / 3)
 )
@@ -63,6 +64,7 @@ type Server struct {
 	reg       Registry
 	listeners map[uint16]*session // port → the session that listens on it
 	opened    map[uint16]bool     // ports with an open daemon listener
+	listenMu  sync.Mutex          // serializes listen (ownership, daemon Listen and rollback)
 	self      protocol.Addr
 	selfKey   string
 }
@@ -116,18 +118,27 @@ func (s *Server) Serve(ln net.Listener, check func(net.Conn) error) error {
 			c.Close()
 			continue
 		}
-		ss := &session{srv: s, c: c, streams: map[string]net.Conn{}}
+		ss := &session{srv: s, c: c, streams: map[string]*stream{}, inflight: make(chan struct{}, MaxInFlight)}
 		go ss.run()
 	}
 }
 
 type session struct {
-	srv     *Server
-	c       net.Conn
-	wmu     sync.Mutex
-	mu      sync.Mutex
-	streams map[string]net.Conn
-	closed  bool
+	srv      *Server
+	c        net.Conn
+	wmu      sync.Mutex
+	mu       sync.Mutex
+	streams  map[string]*stream
+	reserved int // dials in progress, counted against MaxStreams
+	closed   bool
+	inflight chan struct{}
+}
+
+// stream is one open Pilot stream. Reads and writes are each serialized, so a deadline set for one read (or write)
+// cannot be overwritten by a concurrent call of the same kind; calls of the same kind run one at a time.
+type stream struct {
+	c        net.Conn
+	rmu, wmu sync.Mutex
 }
 
 type request struct {
@@ -163,7 +174,14 @@ func (ss *session) run() {
 		if d.Decode(&req) != nil || req.ID == nil || req.Method == "" {
 			return // a malformed line ends the session: the Client is out of sync
 		}
+		select {
+		case ss.inflight <- struct{}{}:
+		default:
+			ss.send(map[string]any{"id": *req.ID, "error": map[string]string{"code": string(errBusy)}})
+			continue
+		}
 		go func(req request) {
+			defer func() { <-ss.inflight }()
 			res, err := ss.dispatch(req.Method, req.Params)
 			if err != nil {
 				var ae apiError
@@ -200,10 +218,10 @@ func (ss *session) end() {
 	ss.mu.Lock()
 	ss.closed = true
 	streams := ss.streams
-	ss.streams = map[string]net.Conn{}
+	ss.streams = map[string]*stream{}
 	ss.mu.Unlock()
-	for _, c := range streams {
-		c.Close()
+	for _, st := range streams {
+		st.c.Close()
 	}
 	ss.srv.mu.Lock()
 	for port, owner := range ss.srv.listeners {
@@ -223,34 +241,57 @@ func newHandle() string {
 	return hex.EncodeToString(b)
 }
 
-func (ss *session) add(c net.Conn) (string, bool) {
+// reserve claims one stream slot before a dial, so concurrent dials cannot exceed MaxStreams.
+func (ss *session) reserve() bool {
 	ss.mu.Lock()
 	defer ss.mu.Unlock()
-	if ss.closed || len(ss.streams) >= MaxStreams {
+	if ss.closed || len(ss.streams)+ss.reserved >= MaxStreams {
+		return false
+	}
+	ss.reserved++
+	return true
+}
+
+// add registers c; reserved says whether a slot was claimed with reserve. It fails (and the caller closes c) if
+// the session ended or, for unreserved incoming streams, the session is full.
+func (ss *session) add(c net.Conn, reserved bool) (string, bool) {
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+	if reserved {
+		ss.reserved--
+	}
+	if ss.closed || (!reserved && len(ss.streams)+ss.reserved >= MaxStreams) {
 		return "", false
 	}
 	h := newHandle()
-	ss.streams[h] = c
+	ss.streams[h] = &stream{c: c}
 	return h, true
 }
 
-func (ss *session) get(h string) (net.Conn, error) {
+func (ss *session) release() {
+	ss.mu.Lock()
+	ss.reserved--
+	ss.mu.Unlock()
+}
+
+func (ss *session) get(h string) (*stream, error) {
 	ss.mu.Lock()
 	defer ss.mu.Unlock()
-	c, ok := ss.streams[h]
+	st, ok := ss.streams[h]
 	if !ok {
 		return nil, errUnknownConn
 	}
-	return c, nil
+	return st, nil
 }
 
+// drop closes and forgets a handle (after stream.close or a fatal stream error).
 func (ss *session) drop(h string) {
 	ss.mu.Lock()
-	c := ss.streams[h]
+	st := ss.streams[h]
 	delete(ss.streams, h)
 	ss.mu.Unlock()
-	if c != nil {
-		c.Close()
+	if st != nil {
+		st.c.Close()
 	}
 }
 
@@ -384,14 +425,18 @@ func (ss *session) dispatch(method string, raw json.RawMessage) (any, error) {
 		if err != nil {
 			return nil, err
 		}
+		if !ss.reserve() {
+			return nil, errBusy
+		}
 		c, err := s.D.Dial(a, uint16(p.Port), to)
 		if err != nil {
+			ss.release()
 			return nil, errDial
 		}
-		h, ok := ss.add(c)
+		h, ok := ss.add(c, true)
 		if !ok {
 			c.Close()
-			return nil, errBusy
+			return nil, errClosed
 		}
 		return map[string]any{"conn": h}, nil
 
@@ -415,13 +460,17 @@ func (ss *session) dispatch(method string, raw json.RawMessage) (any, error) {
 		if err != nil {
 			return nil, err
 		}
-		c, err := ss.get(p.Conn)
+		st, err := ss.get(p.Conn)
 		if err != nil {
 			return nil, err
 		}
-		c.SetWriteDeadline(time.Now().Add(to))
-		n, err := c.Write(data)
+		st.wmu.Lock()
+		st.c.SetWriteDeadline(time.Now().Add(to))
+		n, err := st.c.Write(data)
+		st.wmu.Unlock()
 		if err != nil {
+			// A failed or timed-out write leaves an unknown number of bytes sent: the stream is unusable.
+			ss.drop(p.Conn)
 			if errors.Is(err, os.ErrDeadlineExceeded) {
 				return nil, errTimeout
 			}
@@ -445,13 +494,15 @@ func (ss *session) dispatch(method string, raw json.RawMessage) (any, error) {
 		if err != nil {
 			return nil, err
 		}
-		c, err := ss.get(p.Conn)
+		st, err := ss.get(p.Conn)
 		if err != nil {
 			return nil, err
 		}
 		buf := make([]byte, p.Max)
-		c.SetReadDeadline(time.Now().Add(to))
-		n, err := c.Read(buf)
+		st.rmu.Lock()
+		st.c.SetReadDeadline(time.Now().Add(to))
+		n, err := st.c.Read(buf)
+		st.rmu.Unlock()
 		switch {
 		case n > 0:
 			return map[string]any{"data_b64": base64.StdEncoding.EncodeToString(buf[:n]), "eof": false}, nil
@@ -460,8 +511,9 @@ func (ss *session) dispatch(method string, raw json.RawMessage) (any, error) {
 		case errors.Is(err, io.EOF):
 			return map[string]any{"data_b64": "", "eof": true}, nil
 		case errors.Is(err, os.ErrDeadlineExceeded):
-			return nil, errTimeout
+			return nil, errTimeout // nothing was consumed; the stream stays usable
 		}
+		ss.drop(p.Conn)
 		return nil, errRead
 
 	case "stream.close":
@@ -509,17 +561,26 @@ func (s *Server) lookup(a protocol.Addr) (any, error) {
 	return map[string]any{"public_key": k}, nil
 }
 
-// listen makes ss the receiver of incoming streams on port. The daemon listener is opened once per port and
-// kept for the Bridge's lifetime; streams arriving while no session listens are closed.
+// listen makes ss the receiver of incoming streams on port. Ownership is exclusive; an ended session can never
+// become (or stay) the owner. The daemon listener is opened once per port and kept for the Bridge's lifetime;
+// streams arriving while no session listens are closed.
 func (s *Server) listen(ss *session, port uint16) error {
+	s.listenMu.Lock()
+	defer s.listenMu.Unlock()
 	s.mu.Lock()
 	if owner, ok := s.listeners[port]; ok && owner != ss {
 		s.mu.Unlock()
 		return errBusy
 	}
-	opened := s.opened[port]
+	ss.mu.Lock()
+	closed := ss.closed
+	ss.mu.Unlock()
+	if closed { // end() sets closed before it removes ownership, so this check under s.mu cannot race with it
+		s.mu.Unlock()
+		return errClosed
+	}
 	s.listeners[port] = ss
-	s.opened[port] = true
+	opened := s.opened[port]
 	s.mu.Unlock()
 	if opened {
 		return nil
@@ -527,37 +588,43 @@ func (s *Server) listen(ss *session, port uint16) error {
 	l, err := s.D.Listen(port)
 	if err != nil {
 		s.mu.Lock()
-		delete(s.listeners, port)
-		delete(s.opened, port)
+		if s.listeners[port] == ss {
+			delete(s.listeners, port)
+		}
 		s.mu.Unlock()
 		return errDaemon
 	}
-	go func() {
-		for {
-			c, err := l.Accept()
-			if err != nil {
-				log.Printf("listener on port %d stopped: %v", port, err)
-				os.Exit(2) // the daemon connection is gone; the supervisor restarts the Bridge
-			}
-			s.mu.Lock()
-			owner := s.listeners[port]
-			s.mu.Unlock()
-			if owner == nil {
-				c.Close()
-				continue
-			}
-			sa, err := protocol.ParseSocketAddr(c.RemoteAddr().String())
-			if err != nil {
-				c.Close()
-				continue
-			}
-			h, ok := owner.add(c)
-			if !ok {
-				c.Close()
-				continue
-			}
-			owner.send(map[string]any{"event": "stream.incoming", "conn": h, "port": port, "remote_addr": sa.Addr.String()})
-		}
-	}()
+	s.mu.Lock()
+	s.opened[port] = true
+	s.mu.Unlock()
+	go s.accept(l, port)
 	return nil
+}
+
+func (s *Server) accept(l Listener, port uint16) {
+	for {
+		c, err := l.Accept()
+		if err != nil {
+			log.Printf("listener on port %d stopped: %v", port, err)
+			os.Exit(2) // the daemon connection is gone; the supervisor restarts the Bridge
+		}
+		s.mu.Lock()
+		owner := s.listeners[port]
+		s.mu.Unlock()
+		if owner == nil {
+			c.Close()
+			continue
+		}
+		sa, err := protocol.ParseSocketAddr(c.RemoteAddr().String())
+		if err != nil {
+			c.Close()
+			continue
+		}
+		h, ok := owner.add(c, false)
+		if !ok {
+			c.Close()
+			continue
+		}
+		owner.send(map[string]any{"event": "stream.incoming", "conn": h, "port": port, "remote_addr": sa.Addr.String()})
+	}
 }
