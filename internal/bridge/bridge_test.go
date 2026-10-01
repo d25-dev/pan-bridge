@@ -347,3 +347,59 @@ func TestConcurrentDialsBounded(t *testing.T) {
 		t.Fatalf("%d dials succeeded, want %d", ok, MaxStreams)
 	}
 }
+
+// A write queued behind a failing write on the same stream must not be sent after the failure.
+func TestQueuedWriteAfterFailureIsRefused(t *testing.T) {
+	f, dial := start(t)
+	c := dial()
+	r, _ := c.call("stream.dial", map[string]any{"addr": "0:0000.0000.0002", "port": 1001, "timeout_ms": 1000})
+	far := <-f.dialed // never reads: the first write blocks until its deadline
+	defer far.Close()
+	data := base64.StdEncoding.EncodeToString([]byte("x"))
+	for i := 0; i < 2; i++ {
+		c.id++
+		b, _ := json.Marshal(map[string]any{"id": c.id, "method": "stream.write", "params": map[string]any{"conn": r["conn"], "data_b64": data, "timeout_ms": 300}})
+		c.c.Write(append(b, '\n'))
+	}
+	codes := map[string]int{}
+	for i := 0; i < 2; i++ {
+		m := c.next()
+		if e, ok := m["error"].(map[string]any); ok {
+			codes[e["code"].(string)]++
+		} else {
+			codes["ok"]++
+		}
+	}
+	if codes["TIMEOUT"] != 1 || codes["UNKNOWN_CONN"] != 1 {
+		t.Fatalf("results %v, want one TIMEOUT and one UNKNOWN_CONN", codes)
+	}
+}
+
+// More than 65552 decoded bytes in one write is refused.
+func TestWriteLimitAfterDecoding(t *testing.T) {
+	f, dial := start(t)
+	c := dial()
+	r, _ := c.call("stream.dial", map[string]any{"addr": "0:0000.0000.0002", "port": 1001, "timeout_ms": 1000})
+	<-f.dialed
+	big := base64.StdEncoding.EncodeToString(make([]byte, MaxRead+1))
+	if _, e := c.call("stream.write", map[string]any{"conn": r["conn"], "data_b64": big, "timeout_ms": 100}); e != "BAD_REQUEST" {
+		t.Fatalf("oversized write: %q", e)
+	}
+}
+
+// With every backend slot held by stalled calls, further untimed calls are answered BUSY at once.
+func TestBackendSlotsBounded(t *testing.T) {
+	release := make(chan struct{})
+	for i := 0; i < cap(backend); i++ {
+		go bounded(func() (any, error) { <-release; return nil, nil })
+	}
+	defer close(release)
+	time.Sleep(50 * time.Millisecond)
+	t0 := time.Now()
+	if _, err := bounded(func() (any, error) { return nil, nil }); !errors.Is(err, errBusy) {
+		t.Fatalf("got %v, want BUSY", err)
+	}
+	if time.Since(t0) > time.Second {
+		t.Fatal("BUSY was not immediate")
+	}
+}

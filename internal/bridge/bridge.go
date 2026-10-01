@@ -274,6 +274,13 @@ func (ss *session) release() {
 	ss.mu.Unlock()
 }
 
+// current reports whether h still names st (it was not retired meanwhile).
+func (ss *session) current(h string, st *stream) bool {
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+	return ss.streams[h] == st
+}
+
 func (ss *session) get(h string) (*stream, error) {
 	ss.mu.Lock()
 	defer ss.mu.Unlock()
@@ -318,15 +325,28 @@ func timeout(ms int) (time.Duration, error) {
 // internalTimeout bounds calls that take no timeout_ms (BRIDGE_API §5): handshake, trusted peers, registry lookup.
 const internalTimeout = 10 * time.Second
 
-// bounded runs f with internalTimeout. On expiry it answers TIMEOUT; f keeps running until the daemon or registry
-// returns, and its result is discarded.
+// backend bounds the daemon/registry calls running at once, including ones abandoned after a timeout, so a stalled
+// daemon cannot accumulate unbounded work.
+var backend = make(chan struct{}, 16)
+
+// bounded runs f with internalTimeout. On expiry it answers TIMEOUT; f keeps running (holding its backend slot)
+// until the daemon or registry returns, and its result is discarded. With all slots held it answers BUSY.
 func bounded(f func() (any, error)) (any, error) {
 	type out struct {
 		v   any
 		err error
 	}
+	select {
+	case backend <- struct{}{}:
+	default:
+		return nil, errBusy
+	}
 	ch := make(chan out, 1)
-	go func() { v, err := f(); ch <- out{v, err} }()
+	go func() {
+		defer func() { <-backend }()
+		v, err := f()
+		ch <- out{v, err}
+	}()
 	select {
 	case o := <-ch:
 		return o.v, o.err
@@ -432,7 +452,7 @@ func (ss *session) dispatch(method string, raw json.RawMessage) (any, error) {
 		if p.Port < 1 || p.Port > 65535 {
 			return nil, errBadRequest
 		}
-		return map[string]any{}, s.listen(ss, uint16(p.Port))
+		return bounded(func() (any, error) { return map[string]any{}, s.listen(ss, uint16(p.Port)) })
 
 	case "stream.dial":
 		var p struct {
@@ -479,7 +499,7 @@ func (ss *session) dispatch(method string, raw json.RawMessage) (any, error) {
 			return nil, errBadRequest
 		}
 		data, err := base64.StdEncoding.DecodeString(p.DataB64)
-		if err != nil || len(data) == 0 {
+		if err != nil || len(data) == 0 || len(data) > MaxRead {
 			return nil, errBadRequest
 		}
 		to, err := timeout(p.TimeoutMS)
@@ -491,11 +511,15 @@ func (ss *session) dispatch(method string, raw json.RawMessage) (any, error) {
 			return nil, err
 		}
 		st.wmu.Lock()
+		defer st.wmu.Unlock()
+		if !ss.current(p.Conn, st) { // retired while this call waited for the stream
+			return nil, errUnknownConn
+		}
 		st.c.SetWriteDeadline(time.Now().Add(to))
 		n, err := st.c.Write(data)
-		st.wmu.Unlock()
 		if err != nil {
-			// A failed or timed-out write leaves an unknown number of bytes sent: the stream is unusable.
+			// A failed or timed-out write leaves an unknown number of bytes sent: the stream is unusable. It is
+			// retired before the lock is released, so no queued write can follow it on this stream.
 			ss.drop(p.Conn)
 			if errors.Is(err, os.ErrDeadlineExceeded) {
 				return nil, errTimeout
@@ -526,9 +550,12 @@ func (ss *session) dispatch(method string, raw json.RawMessage) (any, error) {
 		}
 		buf := make([]byte, p.Max)
 		st.rmu.Lock()
+		defer st.rmu.Unlock()
+		if !ss.current(p.Conn, st) {
+			return nil, errUnknownConn
+		}
 		st.c.SetReadDeadline(time.Now().Add(to))
 		n, err := st.c.Read(buf)
-		st.rmu.Unlock()
 		switch {
 		case n > 0:
 			return map[string]any{"data_b64": base64.StdEncoding.EncodeToString(buf[:n]), "eof": false}, nil
