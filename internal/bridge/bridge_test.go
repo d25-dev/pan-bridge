@@ -1,0 +1,277 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+package bridge
+
+import (
+	"bufio"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"net"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/pilot-protocol/common/protocol"
+)
+
+// fakeDaemon connects dials to in-memory pipes and lets tests inject incoming streams.
+type fakeDaemon struct {
+	dialed   chan net.Conn // far ends of dialed streams
+	incoming chan net.Conn
+	trusted  []any
+}
+
+type fakeListener struct{ ch chan net.Conn }
+
+func (l fakeListener) Accept() (net.Conn, error) {
+	c, ok := <-l.ch
+	if !ok {
+		return nil, errors.New("closed")
+	}
+	return c, nil
+}
+func (l fakeListener) Close() error { return nil }
+
+type addrConn struct {
+	net.Conn
+	remote string
+}
+
+type pilotAddr string
+
+func (a pilotAddr) Network() string { return "pilot" }
+func (a pilotAddr) String() string  { return string(a) }
+
+func (c addrConn) RemoteAddr() net.Addr { return pilotAddr(c.remote) }
+
+func (f *fakeDaemon) Info() (map[string]interface{}, error) {
+	return map[string]interface{}{"address": "0:0000.0000.0001", "public_key": "aa"}, nil
+}
+func (f *fakeDaemon) Handshake(uint32, string) (map[string]interface{}, error) { return nil, nil }
+func (f *fakeDaemon) TrustedPeers() (map[string]interface{}, error) {
+	return map[string]interface{}{"trusted": f.trusted}, nil
+}
+func (f *fakeDaemon) Dial(protocol.Addr, uint16, time.Duration) (net.Conn, error) {
+	a, b := net.Pipe()
+	f.dialed <- b
+	return a, nil
+}
+func (f *fakeDaemon) Listen(uint16) (Listener, error) { return fakeListener{f.incoming}, nil }
+
+type fakeRegistry struct{}
+
+func (fakeRegistry) Lookup(n uint32) (map[string]interface{}, error) {
+	if n == 9 {
+		return nil, errors.New("node not found")
+	}
+	return map[string]interface{}{"public_key": "bb"}, nil
+}
+
+type client struct {
+	t  *testing.T
+	c  net.Conn
+	r  *bufio.Reader
+	id uint64
+}
+
+func (c *client) call(method string, params any) (map[string]any, string) {
+	c.t.Helper()
+	c.id++
+	b, _ := json.Marshal(map[string]any{"id": c.id, "method": method, "params": params})
+	c.c.Write(append(b, '\n'))
+	for {
+		m := c.next()
+		if _, ok := m["event"]; ok {
+			continue
+		}
+		if e, ok := m["error"].(map[string]any); ok {
+			return nil, e["code"].(string)
+		}
+		r, _ := m["result"].(map[string]any)
+		return r, ""
+	}
+}
+
+func (c *client) next() map[string]any {
+	c.t.Helper()
+	c.c.SetReadDeadline(time.Now().Add(5 * time.Second))
+	line, err := c.r.ReadBytes('\n')
+	if err != nil {
+		c.t.Fatalf("read: %v", err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(line, &m); err != nil {
+		c.t.Fatalf("decode %q: %v", line, err)
+	}
+	return m
+}
+
+func start(t *testing.T) (*fakeDaemon, func() *client) {
+	t.Helper()
+	f := &fakeDaemon{dialed: make(chan net.Conn, 32), incoming: make(chan net.Conn, 32),
+		trusted: []any{map[string]any{"node_id": float64(2), "public_key": "cc"}}}
+	s := &Server{D: f, Version: "test", R: func() (Registry, error) { return fakeRegistry{}, nil }}
+	if err := s.Init(); err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(t.TempDir(), "rt")
+	ln, _, err := ListenSocket(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go s.Serve(ln, SameUser)
+	return f, func() *client {
+		c, err := net.Dial("unix", filepath.Join(dir, "bridge.sock"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { c.Close() })
+		return &client{t: t, c: c, r: bufio.NewReader(c)}
+	}
+}
+
+func TestHelloTrustedLookup(t *testing.T) {
+	_, dial := start(t)
+	c := dial()
+	r, e := c.call("hello", map[string]int{"api": 1})
+	if e != "" || r["addr"] != "0:0000.0000.0001" || r["public_key"] != "aa" {
+		t.Fatalf("hello = %v %s", r, e)
+	}
+	if _, e := c.call("hello", map[string]int{"api": 2}); e != "UNSUPPORTED_API" {
+		t.Fatalf("hello api 2: %s", e)
+	}
+	r, _ = c.call("peer.trusted", map[string]any{})
+	if p := r["peers"].([]any); len(p) != 1 || p[0].(map[string]any)["addr"] != "0:0000.0000.0002" {
+		t.Fatalf("trusted = %v", r)
+	}
+	if r, e := c.call("registry.lookup", map[string]string{"addr": "0:0000.0000.0002"}); e != "" || r["public_key"] != "bb" {
+		t.Fatalf("lookup = %v %s", r, e)
+	}
+	if _, e := c.call("registry.lookup", map[string]string{"addr": "0:0000.0000.0009"}); e != "NOT_FOUND" {
+		t.Fatalf("lookup missing: %s", e)
+	}
+	if _, e := c.call("registry.lookup", map[string]string{"addr": "0:0.0.2"}); e != "BAD_REQUEST" {
+		t.Fatalf("non-canonical address accepted: %s", e)
+	}
+	if _, e := c.call("hello", map[string]any{"api": 1, "extra": true}); e != "BAD_REQUEST" {
+		t.Fatalf("unknown field accepted: %s", e)
+	}
+}
+
+func TestDialWriteReadClose(t *testing.T) {
+	f, dial := start(t)
+	c := dial()
+	r, e := c.call("stream.dial", map[string]any{"addr": "0:0000.0000.0002", "port": 1001, "timeout_ms": 1000})
+	if e != "" {
+		t.Fatal(e)
+	}
+	h := r["conn"].(string)
+	far := <-f.dialed
+	go func() {
+		buf := make([]byte, 5)
+		far.Read(buf)
+		far.Write([]byte("ack:" + string(buf)))
+		far.Close()
+	}()
+	if r, e := c.call("stream.write", map[string]any{"conn": h, "data_b64": base64.StdEncoding.EncodeToString([]byte("hello")), "timeout_ms": 1000}); e != "" || r["written"] != float64(5) {
+		t.Fatalf("write = %v %s", r, e)
+	}
+	var got []byte
+	for {
+		r, e := c.call("stream.read", map[string]any{"conn": h, "max": 64, "timeout_ms": 1000})
+		if e != "" {
+			t.Fatal(e)
+		}
+		b, _ := base64.StdEncoding.DecodeString(r["data_b64"].(string))
+		got = append(got, b...)
+		if r["eof"] == true {
+			break
+		}
+	}
+	if string(got) != "ack:hello" {
+		t.Fatalf("read %q", got)
+	}
+	if _, e := c.call("stream.close", map[string]any{"conn": h}); e != "" {
+		t.Fatal(e)
+	}
+	if _, e := c.call("stream.read", map[string]any{"conn": h, "max": 1, "timeout_ms": 100}); e != "UNKNOWN_CONN" {
+		t.Fatalf("closed handle usable: %s", e)
+	}
+}
+
+// An incoming stream is announced with its transport address, and no byte is consumed before the Client reads.
+func TestIncomingNotReadUntilAsked(t *testing.T) {
+	f, dial := start(t)
+	c := dial()
+	if _, e := c.call("listen", map[string]any{"port": 1001}); e != "" {
+		t.Fatal(e)
+	}
+	a, b := net.Pipe()
+	f.incoming <- addrConn{a, "0:0000.0000.0002:49152"}
+	ev := c.next()
+	if ev["event"] != "stream.incoming" || ev["remote_addr"] != "0:0000.0000.0002" {
+		t.Fatalf("event = %v", ev)
+	}
+	wrote := make(chan error, 1)
+	go func() { _, err := b.Write([]byte("x")); wrote <- err }()
+	select {
+	case <-wrote: // net.Pipe is unbuffered: a completed write would mean the Bridge read on its own
+		t.Fatal("bridge consumed bytes before stream.read")
+	case <-time.After(300 * time.Millisecond):
+	}
+	r, e := c.call("stream.read", map[string]any{"conn": ev["conn"], "max": 1, "timeout_ms": 1000})
+	if e != "" || r["data_b64"] != base64.StdEncoding.EncodeToString([]byte("x")) {
+		t.Fatalf("read = %v %s", r, e)
+	}
+}
+
+// Handles are bound to their session; a second session cannot listen on a taken port; ending a session closes
+// its streams.
+func TestSessionIsolation(t *testing.T) {
+	f, dial := start(t)
+	c1, c2 := dial(), dial()
+	r, _ := c1.call("stream.dial", map[string]any{"addr": "0:0000.0000.0002", "port": 1001, "timeout_ms": 1000})
+	far := <-f.dialed
+	if _, e := c2.call("stream.read", map[string]any{"conn": r["conn"], "max": 1, "timeout_ms": 100}); e != "UNKNOWN_CONN" {
+		t.Fatalf("cross-session handle accepted: %s", e)
+	}
+	if _, e := c1.call("listen", map[string]any{"port": 1001}); e != "" {
+		t.Fatal(e)
+	}
+	if _, e := c2.call("listen", map[string]any{"port": 1001}); e != "BUSY" {
+		t.Fatalf("second listener: %s", e)
+	}
+	c1.c.Close()
+	far.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := far.Read(make([]byte, 1)); err == nil || errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("stream not closed with its session: %v", err)
+	}
+}
+
+func TestStreamLimit(t *testing.T) {
+	f, dial := start(t)
+	c := dial()
+	for i := 0; i < MaxStreams; i++ {
+		if _, e := c.call("stream.dial", map[string]any{"addr": "0:0000.0000.0002", "port": 1001, "timeout_ms": 1000}); e != "" {
+			t.Fatal(e)
+		}
+		<-f.dialed
+	}
+	if _, e := c.call("stream.dial", map[string]any{"addr": "0:0000.0000.0002", "port": 1001, "timeout_ms": 1000}); e != "BUSY" {
+		t.Fatalf("over the limit: %s", e)
+	}
+}
+
+func TestMalformedLineEndsSession(t *testing.T) {
+	_, dial := start(t)
+	c := dial()
+	c.c.Write([]byte("{not json\n"))
+	c.c.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := c.r.ReadByte(); err == nil || strings.Contains(err.Error(), "timeout") {
+		t.Fatalf("session kept open after a malformed line: %v", err)
+	}
+}

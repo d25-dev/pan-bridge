@@ -1,0 +1,44 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+package bridge
+
+import (
+	"fmt"
+	"net"
+	"os"
+	"path/filepath"
+	"syscall"
+)
+
+// ListenSocket creates <dir>/bridge.sock per Bridge API §2: dir must be (or is created as) a 0700 directory owned
+// by this user; a stale socket owned by this user is removed; the socket is created with mode 0600.
+func ListenSocket(dir string) (net.Listener, string, error) {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return nil, "", err
+	}
+	st, err := os.Lstat(dir)
+	if err != nil {
+		return nil, "", err
+	}
+	sys, ok := st.Sys().(*syscall.Stat_t)
+	if !st.IsDir() || st.Mode().Perm() != 0o700 || !ok || int(sys.Uid) != os.Getuid() {
+		return nil, "", fmt.Errorf("runtime dir %s must be a 0700 directory owned by uid %d", dir, os.Getuid())
+	}
+	path := filepath.Join(dir, "bridge.sock")
+	if fi, err := os.Lstat(path); err == nil {
+		s, ok := fi.Sys().(*syscall.Stat_t)
+		if fi.Mode()&os.ModeSocket == 0 || !ok || int(s.Uid) != os.Getuid() {
+			return nil, "", fmt.Errorf("%s exists and is not our socket", path)
+		}
+		if err := os.Remove(path); err != nil {
+			return nil, "", err
+		}
+	}
+	old := syscall.Umask(0o177)
+	ln, err := net.Listen("unix", path)
+	syscall.Umask(old)
+	if err != nil {
+		return nil, "", err
+	}
+	return ln, path, nil
+}
