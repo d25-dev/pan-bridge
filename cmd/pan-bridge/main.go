@@ -9,10 +9,10 @@ import (
 	"net"
 	"time"
 
+	"github.com/d25-dev/pan-bridge/internal/bridge"
 	"github.com/pilot-protocol/common/driver"
 	"github.com/pilot-protocol/common/protocol"
 	registry "github.com/pilot-protocol/common/registry/client"
-	"github.com/uyah/pan-bridge/internal/bridge"
 )
 
 var version = "0.1.0-dev"

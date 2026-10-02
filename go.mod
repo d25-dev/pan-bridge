@@ -1,4 +1,4 @@
-module github.com/uyah/pan-bridge
+module github.com/d25-dev/pan-bridge
 
 go 1.25.13
 
