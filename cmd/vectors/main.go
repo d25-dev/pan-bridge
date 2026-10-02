@@ -214,7 +214,7 @@ type Expect struct {
 	Code       string `json:"code"`
 	Stage      string `json:"stage"`
 	Rule       string `json:"rule"`
-	PilotError string `json:"pilot_error,omitempty"`
+	PilotError string `json:"-"` // checked against the in-memory vectors only; not published (it would quote Pilot error text)
 }
 
 type FrameVec struct {
