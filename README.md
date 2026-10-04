@@ -6,3 +6,5 @@ the Client does that from the public specification (`pan-protocol/spec/WIRE_FORM
 
 Licence: AGPL-3.0-or-later (it links Pilot Protocol packages, which are AGPL-3.0-or-later). See `LICENSE`.
 Also contains `cmd/vectors`, the reference generator for the pan-protocol test vectors.
+
+Copyright (C) 2026 Yuya Uwatoko. Licensed under AGPL-3.0-or-later; see NOTICE.

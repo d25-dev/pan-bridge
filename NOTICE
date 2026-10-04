@@ -1,0 +1,9 @@
+pan-bridge
+Copyright (C) 2026 Yuya Uwatoko
+
+This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero
+General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your
+option) any later version. See LICENSE.
+
+It links Pilot Protocol packages (github.com/pilot-protocol/common, github.com/pilot-protocol/dataexchange),
+which are licensed under AGPL-3.0-or-later by their authors.

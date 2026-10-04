@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Yuya Uwatoko
 
 // pan-bridge serves Bridge API v1 (pan-protocol spec/BRIDGE_API.md) on a local Unix socket for one Client.
 package main

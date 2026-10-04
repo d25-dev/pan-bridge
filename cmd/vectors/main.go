@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Yuya Uwatoko
 
 // Command vectors writes the deterministic pan-protocol test vectors for
 // WIRE_FORMAT.md using the Pilot Protocol packages the Client links.

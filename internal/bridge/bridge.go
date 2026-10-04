@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Yuya Uwatoko
 
 // Package bridge implements Bridge API v1 (pan-protocol spec/BRIDGE_API.md): a thin local bridge that gives a
 // Client access to the Pilot network. It opens and accepts streams, moves bytes and reports transport facts. It
