@@ -21,6 +21,9 @@ import (
 // strings), using the Pilot code, so a vector cannot pass because of state
 // that is not written out.
 func check(v Vectors) error {
+	if err := checkV2(v.V2); err != nil {
+		return fmt.Errorf("v2: %w", err)
+	}
 	var s Scope
 	if err := strictJSON([]byte(v.Fixture.ScopeJSON), &s); err != nil {
 		return fmt.Errorf("fixture scope_json: %w", err)

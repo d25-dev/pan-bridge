@@ -248,6 +248,7 @@ type Vectors struct {
 	Objects  Objects
 	Frames   Frames     // positive governed frames
 	Negative []FrameVec // rejected frames
+	V2       V2         // profile v2 (delegated case keys)
 }
 
 func objVec(id, desc, kind string, pub ed25519.PublicKey, v any, canonical []byte, hash, sig string) ObjectVec {
@@ -383,6 +384,7 @@ func build() Vectors {
 	v.Frames.Plain = append(v.Frames.Plain, PlainFrameVec{"text-empty", dataexchange.TypeText, "", hex.EncodeToString(frameBytes(dataexchange.TypeText, nil))})
 
 	v.Negative = negatives(offer, invite, gA)
+	v.V2, _ = buildV2()
 	return v
 }
 
@@ -515,7 +517,7 @@ func writeJSON(dir, name string, v any) error {
 
 // files maps each output file to its content.
 func files(v Vectors) map[string]any {
-	return map[string]any{"fixture.json": v.Fixture, "objects.json": v.Objects, "frames.json": v.Frames, "negative.json": v.Negative}
+	return map[string]any{"fixture.json": v.Fixture, "objects.json": v.Objects, "frames.json": v.Frames, "negative.json": v.Negative, "v2.json": v.V2}
 }
 
 func main() {

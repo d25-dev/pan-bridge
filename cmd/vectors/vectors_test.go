@@ -53,7 +53,7 @@ func TestVectors(t *testing.T) {
 	}
 	// Verify what is on disk independently of build(): parse and check.
 	var v Vectors
-	for name, dst := range map[string]any{"fixture.json": &v.Fixture, "objects.json": &v.Objects, "frames.json": &v.Frames, "negative.json": &v.Negative} {
+	for name, dst := range map[string]any{"fixture.json": &v.Fixture, "objects.json": &v.Objects, "frames.json": &v.Frames, "negative.json": &v.Negative, "v2.json": &v.V2} {
 		b, err := os.ReadFile(filepath.Join(*published, name))
 		if err != nil {
 			t.Skipf("published vectors not readable: %v", err)
@@ -65,6 +65,7 @@ func TestVectors(t *testing.T) {
 	if err := check(v); err != nil {
 		t.Fatal(err)
 	}
+	t.Logf("v2: %d grants, %d frames", len(v.V2.Grants), len(v.V2.Frames))
 	t.Logf("verified %d positive governed, %d plain, %d negative frames; %d mandates, %d intents, %d decisions, %d payload hashes",
 		len(v.Frames.Governed), len(v.Frames.Plain), len(v.Negative), len(v.Objects.Mandates), len(v.Objects.Intents), len(v.Objects.Decisions), len(v.Objects.PayloadHashes))
 }
