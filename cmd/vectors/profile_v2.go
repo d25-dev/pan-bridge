@@ -188,8 +188,8 @@ func receiveV2(raw []byte, self string, peer Participant, s Scope, now time.Time
 			}
 		}
 	} else {
-		if stored == nil {
-			return Outcome{"DENIED_PROOF", StageVerifyGoverned, errors.New("no accepted grant for this case")}
+		if stored == nil { // the case cannot be active yet: the sender retries (PROFILE_V2_DELEGATION §5)
+			return Outcome{"NOT_YET_ACTIVE", StageVerifyGoverned, errors.New("no accepted grant for this case")}
 		}
 		if delegate, err = verifyGrantV2(stored, authority, peer.Party, self, s, now); err != nil {
 			return Outcome{"DENIED_PROOF", StageVerifyGoverned, err}
@@ -286,7 +286,7 @@ func buildV2() (V2, map[string]decision.Mandate) {
 		p.key = delegateOther
 		return p
 	}(), "v2-grant-alice", "DENIED_GRANT", StagePayload)
-	ng("v2-neg-offer-no-grant", "offer before any grant of the peer was accepted", offer, "", "DENIED_PROOF", StageVerifyGoverned)
+	ng("v2-neg-offer-no-grant", "offer before any grant of the peer was accepted (overtook its invite): retry later", offer, "", "NOT_YET_ACTIVE", StageVerifyGoverned)
 	ng("v2-neg-offer-authority-key", "offer signed with the authority key (v1 key ids)", func() proofV2 {
 		p := offer
 		p.key = alice.authority
